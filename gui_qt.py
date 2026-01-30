@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
 PySide6 GUI（暗黑 / neon 主题）重写（替换原 gui_qt.py）
-- 更加“酷炫 / 黑客”风格：全局 QSS 暗色主题、等宽字体、neon 连线与动画、节点发光选中效果
-- 改进点：
-  - 主窗口在构造时应用暗色 QSS（按钮、表单、日志、右侧面板）
-  - NodeItem 覆盖 paint 绘制圆角、阴影与被选中时的霓虹描边
-  - EdgeItem 覆盖 paint 绘制多次半透明描边模拟 glow；提供 start_animation，动画通过内部 QTimer 驱动（沿 path 的点移动）
-  - MainWindow.animate_edge 现在触发 EdgeItem 的内置动画（更顺滑、更容易控制）
-- 兼容之前的 models/engine/utils（无需改动 engine，只要 engine 仍会调用 engine.edge_highlight_callback(src,dst)）
+- 包含改进：连线/节点可选中并删除（Delete 键/右键菜单）
+- Edge 动画与 engine 回调集成
 """
+
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog,
     QLabel, QTextEdit, QFormLayout, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem, QGraphicsEllipseItem,
     QGraphicsPathItem, QGraphicsSimpleTextItem, QApplication, QMessageBox, QMenu
 )
-from PySide6.QtGui import QPen, QBrush, QColor, QPainterPath, QFont, QPainter, QFontDatabase
+from PySide6.QtGui import QPen, QBrush, QColor, QPainterPath, QFont, QPainter, QFontDatabase, QKeySequence
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QEvent
 
 from models import FlowModel, make_default_node
@@ -28,54 +25,17 @@ PORT_R = 7
 
 # ---------- Dark neon stylesheet ----------
 DARK_QSS = """
-/* Basic dark background and mono font */
 QWidget {
   background: #0b0f14;
   color: #cfe8ff;
   font-family: "Consolas", "Courier New", monospace;
   font-size: 11px;
 }
-
-/* Buttons */
-QPushButton {
-  background: #0f1720;
-  border: 1px solid #1e293b;
-  padding: 6px 10px;
-  border-radius: 6px;
-  color: #a8d1ff;
-}
-QPushButton:hover {
-  background: #122032;
-  border-color: #2b9fff;
-  color: #e0f6ff;
-}
-QPushButton:pressed {
-  background: #0b1622;
-}
-
-/* QTextEdit / Logs */
-QTextEdit {
-  background: #071018;
-  border: 1px solid #172a3a;
-  color: #bfe8ff;
-  padding: 6px;
-  border-radius: 6px;
-}
-
-/* QLineEdit / Spin / Combo */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-  background: #07131a;
-  border: 1px solid #1e2f3f;
-  padding: 4px;
-  color: #dff7ff;
-  border-radius: 4px;
-}
-
-/* Form label */
-QLabel {
-  color: #8fbfe6;
-  font-weight: bold;
-}
+QPushButton { background: #0f1720; border: 1px solid #1e293b; padding: 6px 10px; border-radius: 6px; color: #a8d1ff; }
+QPushButton:hover { background: #122032; border-color: #2b9fff; color: #e0f6ff; }
+QTextEdit { background: #071018; border: 1px solid #172a3a; color: #bfe8ff; padding: 6px; border-radius: 6px; }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #07131a; border: 1px solid #1e2f3f; padding: 4px; color: #dff7ff; border-radius: 4px; }
+QLabel { color: #8fbfe6; font-weight: bold; }
 """
 
 # ---------- Node / Edge classes ----------
@@ -95,19 +55,16 @@ class NodeItem(QGraphicsRectItem):
         self.text.setFont(f)
         self.text.setPos(12, 10)
         try:
-            # prevent text from grabbing mouse events
             self.text.setAcceptedMouseButtons(Qt.NoButton)
         except Exception:
             pass
 
-        # set neon text color (prefer setDefaultTextColor if available)
         NEON_GREEN = QColor("#7CFF66")
         NEON_GREEN_BRIGHT = QColor("#BFFF9A")
         if hasattr(self.text, "setDefaultTextColor"):
             try:
                 self.text.setDefaultTextColor(NEON_GREEN)
             except Exception:
-                # fallback to brush
                 self.text.setBrush(QBrush(NEON_GREEN))
         elif hasattr(self.text, "setBrush"):
             self.text.setBrush(QBrush(NEON_GREEN))
@@ -132,7 +89,7 @@ class NodeItem(QGraphicsRectItem):
         self.out_port.setData(0, ("out", model.id))
         self.out_port.setFlag(QGraphicsItem.ItemIsSelectable, False)
 
-        # visual state
+        # visual pulse
         self._pulse = 0.0
         self._pulse_dir = 1
         self._pulse_timer = QTimer()
@@ -140,7 +97,6 @@ class NodeItem(QGraphicsRectItem):
         self._pulse_timer.timeout.connect(self._update_pulse)
 
     def _update_pulse(self):
-        # oscillate 0..1
         if self._pulse_dir > 0:
             self._pulse += 0.08
             if self._pulse >= 1.0:
@@ -154,7 +110,6 @@ class NodeItem(QGraphicsRectItem):
         self.update()
 
     def paint(self, painter: QPainter, option, widget=None):
-        # Rounded rect with subtle gradient
         r = QRectF(0, 0, NODE_W, NODE_H)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.fillRect(r, QBrush(QColor("#0f1720")))
@@ -162,17 +117,14 @@ class NodeItem(QGraphicsRectItem):
         painter.setPen(pen)
         painter.drawRoundedRect(r, 8, 8)
 
-        # if selected, draw neon border
         if self.isSelected():
             glow = 180 + int(75 * self._pulse)
-            neon = QColor(16, 200, 255, glow)  # cyan neon
+            neon = QColor(16, 200, 255, glow)
             for w in (6, 4, 2):
                 p = QPen(neon, w)
                 p.setCosmetic(True)
                 painter.setPen(p)
                 painter.drawRoundedRect(r.adjusted(-w/2, -w/2, w/2, w/2), 8 + w/2, 8 + w/2)
-
-        # note: text and ports are child items and will render themselves
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
@@ -185,30 +137,21 @@ class NodeItem(QGraphicsRectItem):
         self.editor.update_edges_positions()
 
     def itemChange(self, change, value):
-        # selection change: handle pulse and text color
         if change == QGraphicsItem.ItemSelectedChange:
             will_selected = bool(value)
             if will_selected:
                 self._pulse_timer.start()
-                # brighten text
-                if hasattr(self.text, "setDefaultTextColor"):
-                    try:
-                        self.text.setDefaultTextColor(self._text_color_bright)
-                    except Exception:
-                        self.text.setBrush(QBrush(self._text_color_bright))
-                elif hasattr(self.text, "setBrush"):
+                try:
+                    self.text.setDefaultTextColor(self._text_color_bright)
+                except Exception:
                     self.text.setBrush(QBrush(self._text_color_bright))
             else:
                 self._pulse_timer.stop()
                 self._pulse = 0.0
                 self._pulse_dir = 1
-                # restore text color
-                if hasattr(self.text, "setDefaultTextColor"):
-                    try:
-                        self.text.setDefaultTextColor(self._text_color)
-                    except Exception:
-                        self.text.setBrush(QBrush(self._text_color))
-                elif hasattr(self.text, "setBrush"):
+                try:
+                    self.text.setDefaultTextColor(self._text_color)
+                except Exception:
                     self.text.setBrush(QBrush(self._text_color))
             self.update()
 
@@ -232,14 +175,20 @@ class EdgeItem(QGraphicsPathItem):
         self._base_pen = QPen(QColor("#4b5563"), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         self.setPen(self._base_pen)
         self.setAcceptHoverEvents(True)
+        # allow selection
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
 
-        # animation state
+        # animation
         self._anim_timer = QTimer()
         self._anim_timer.setInterval(30)
         self._anim_timer.timeout.connect(self._anim_step)
         self._anim_t = 0.0
         self._anim_steps = 30
         self._animating = False
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self.setSelected(True)
 
     def update_path(self):
         s_rect = self.src_item.out_port.sceneBoundingRect()
@@ -258,10 +207,8 @@ class EdgeItem(QGraphicsPathItem):
     def paint(self, painter: QPainter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing, True)
         path = self.path()
-        # base faint line
         painter.setPen(self._base_pen)
         painter.drawPath(path)
-        # glow layers
         for w, alpha in ((10, 30), (6, 60), (3, 120)):
             p = QPen(self._glow_color, w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
             c = QColor(self._glow_color)
@@ -269,7 +216,6 @@ class EdgeItem(QGraphicsPathItem):
             p.setColor(c)
             painter.setPen(p)
             painter.drawPath(path)
-        # animating dot
         if self._animating:
             t = self._anim_t
             pt = path.pointAtPercent(t)
@@ -303,20 +249,17 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PySide6 流程编辑器 — Dark / Neon")
         self.flow = FlowModel()
 
-        # apply dark style to whole app (if QApplication exists)
+        # apply dark style
         app = QApplication.instance()
         if app:
             app.setStyleSheet(DARK_QSS)
 
-        # main widgets
         central = QWidget()
         self.setCentralWidget(central)
         hl = QHBoxLayout(central)
 
-        # left: scene view
         self.scene = QGraphicsScene()
         self.view = QGraphicsView(self.scene)
-        # render hints: use compatibility-safe setup
         try:
             hints = self.view.renderHints() | QPainter.Antialiasing | QPainter.SmoothPixmapTransform
             if hasattr(QPainter, "HighQualityAntialiasing"):
@@ -326,7 +269,6 @@ class MainWindow(QMainWindow):
             self.view.setRenderHints(self.view.renderHints() | QPainter.Antialiasing)
         hl.addWidget(self.view, 1)
 
-        # right panel
         rightw = QWidget()
         rightlay = QVBoxLayout(rightw)
         hl.addWidget(rightw, 0)
@@ -350,27 +292,27 @@ class MainWindow(QMainWindow):
         self.log = QTextEdit(); self.log.setReadOnly(True)
         rightlay.addWidget(QLabel("日志")); rightlay.addWidget(self.log)
 
-        # internals
         self.node_items = {}
         self.edge_items = {}
 
         self.temp_line = None
         self.connecting_src = None
 
-        # event filter for port drag
         self.view.viewport().installEventFilter(self)
         self.view.setMouseTracking(True)
-
-        # connect selectionChanged
         self.scene.selectionChanged.connect(self.on_selection_changed)
 
-        # engine
+        # add Delete QAction and shortcut
+        del_action = QAction("删除所选", self)
+        del_action.setShortcut(QKeySequence.Delete)
+        del_action.triggered.connect(self.delete_selected_items)
+        self.addAction(del_action)
+
         self.engine = None
 
     def log_msg(self, *parts):
         write_to_qtextedit(self.log, *parts)
 
-    # node/edge helpers
     def add_node(self):
         node = make_default_node(x=80 + len(self.flow.nodes) * 30, y=80 + len(self.flow.nodes) * 20, label_prefix="Node")
         node.label = f"Node{len(self.flow.nodes) + 1}"
@@ -397,7 +339,6 @@ class MainWindow(QMainWindow):
         self.edge_items[(src_id, dst_id)] = e
         self.flow.add_edge(src_id, dst_id)
 
-    # event filter (port drag)
     def eventFilter(self, obj, event):
         if event.type() == QEvent.MouseButtonPress and (event.buttons() & Qt.LeftButton):
             pos = self.view.mapToScene(event.pos())
@@ -478,6 +419,42 @@ class MainWindow(QMainWindow):
         if meta in self.edge_items: del self.edge_items[meta]
         self.log_msg("删除连线", meta)
 
+    # delete selected items (nodes or edges)
+    def delete_selected_items(self):
+        items = list(self.scene.selectedItems())
+        if not items:
+            return
+        for it in items:
+            # edge?
+            if isinstance(it, EdgeItem):
+                try: self.delete_edge(it)
+                except: pass
+                continue
+            # node or child: find parent node
+            node_item = None
+            if isinstance(it, QGraphicsRectItem) and hasattr(it, "model"):
+                node_item = it
+            else:
+                p = None
+                try:
+                    p = it.parentItem()
+                except Exception:
+                    p = None
+                if p is not None and isinstance(p, QGraphicsRectItem) and hasattr(p, "model"):
+                    node_item = p
+            if node_item:
+                try: self.delete_node(node_item)
+                except: pass
+        try: self.scene.clearSelection()
+        except: pass
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_selected_items()
+            event.accept()
+            return
+        return super().keyPressEvent(event)
+
     # save/load
     def save_flow(self):
         p = save_flow_file(self)
@@ -496,10 +473,8 @@ class MainWindow(QMainWindow):
             with open(p, "r", encoding="utf-8") as f:
                 text = f.read()
             self.flow = FlowModel.from_json(text)
-            # clear scene
             self.scene.clear()
             self.node_items.clear(); self.edge_items.clear()
-            # recreate nodes & edges
             for nid, node in self.flow.nodes.items():
                 self._add_node_item(node)
             for src, outs in self.flow.edges.items():
@@ -516,12 +491,13 @@ class MainWindow(QMainWindow):
         for it in items:
             if isinstance(it, QGraphicsRectItem) and hasattr(it, "model"):
                 node_item = it; break
-            # in case a child text/port is selected, pick parent
-            parent = getattr(it, "parentItem", None)
-            if parent and parent() is not None:
-                p = parent()
-                if isinstance(p, QGraphicsRectItem) and hasattr(p, "model"):
-                    node_item = p; break
+            # check parent item
+            try:
+                p = it.parentItem()
+            except Exception:
+                p = None
+            if p is not None and isinstance(p, QGraphicsRectItem) and hasattr(p, "model"):
+                node_item = p; break
         self.current_node_item = node_item
         self.update_properties_for_selection()
 
@@ -543,7 +519,6 @@ class MainWindow(QMainWindow):
         self.le_label = QLineEdit(node.label)
         self.prop_form.addRow("标签:", self.le_label)
 
-        # image
         hbox = QHBoxLayout()
         self.le_image = QLineEdit(node.image_path or "")
         btn_img = QPushButton("选择")
@@ -621,7 +596,6 @@ class MainWindow(QMainWindow):
     def start_engine(self):
         if self.engine and self.engine.is_running():
             self.log_msg("引擎已在运行"); return
-        # log_callback expects single string
         def ui_log(s):
             write_to_qtextedit(self.log, s)
         self.engine = FlowEngine(self.flow, log_callback=ui_log)
